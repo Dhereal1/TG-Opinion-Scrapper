@@ -31,6 +31,7 @@ from telegram import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
 )
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -719,6 +720,36 @@ def build_admin_opinion_msg(user: str, text: str, msg_url: str = "") -> str:
     return "\n".join(lines)
 
 
+async def dm_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> tuple[int, list[str]]:
+    """
+    Send a private DM to all configured admins and return (success_count, failures).
+    Failures include readable reasons to simplify runtime troubleshooting.
+    """
+    ok = 0
+    failures: list[str] = []
+    for admin_id in ADMIN_CHAT_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                disable_web_page_preview=True,
+            )
+            ok += 1
+        except Forbidden as e:
+            reason = (
+                "bot cannot DM this user yet (admin must open bot and press Start)"
+            )
+            logger.error("Failed to DM admin %s: %s (%s)", admin_id, e, reason)
+            failures.append(f"{admin_id}: {reason}")
+        except BadRequest as e:
+            logger.error("Failed to DM admin %s: %s", admin_id, e)
+            failures.append(f"{admin_id}: bad request ({e})")
+        except Exception as e:
+            logger.error("Failed to DM admin %s: %s", admin_id, e)
+            failures.append(f"{admin_id}: {e}")
+    return ok, failures
+
+
 def is_flood(user_id: int) -> bool:
     """Return True if user has sent too many messages in the flood window."""
     now = datetime.utcnow()
@@ -728,7 +759,7 @@ def is_flood(user_id: int) -> bool:
     return len(flood_tracker[user_id]) > FLOOD_MAX_MSGS
 
 
-def answer_question_openai(question: str, memory_snippets: list[dict]) -> str:
+def answer_question_openai(question: str, memory_snippets: list[dict]) -> str | None:
     """Use OpenAI with strict grounding: KB + retrieved memory snippets only."""
     if not OPENAI_API_KEY:
         return None
@@ -758,7 +789,8 @@ def answer_question_openai(question: str, memory_snippets: list[dict]) -> str:
             max_tokens=300,
             temperature=0.4,
         )
-        return resp.choices[0].message.content.strip()
+        content = resp.choices[0].message.content
+        return content.strip() if content else None
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
         return None
@@ -844,7 +876,11 @@ def answer_question_basic(question: str, memory_snippets: list[dict]) -> str:
 
 async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome new members."""
-    for member in update.message.new_chat_members:
+    msg = update.message
+    if not msg:
+        return
+
+    for member in msg.new_chat_members:
         name = member.full_name or member.username or "friend"
         welcome = (
             f"👋 Welcome to *Kickchain*, {name}! ⚽🔗\n\n"
@@ -855,7 +891,7 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💬 Share your ideas, feedback or suggestions — every voice shapes the game!\n\n"
             "_Let's build something great together. Game on!_ 🚀"
         )
-        await update.message.reply_text(welcome, parse_mode="Markdown")
+        await msg.reply_text(welcome, parse_mode="Markdown")
 
 
 async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -864,7 +900,11 @@ async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    msg = update.message
+    if not msg:
+        return
+
+    await msg.reply_text(
         START_TEXT,
         parse_mode="Markdown",
         reply_markup=MAIN_INLINE_MENU,
@@ -872,22 +912,36 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_project(update.message)
+    msg = update.message
+    if not msg:
+        return
+    await send_project(msg)
 
 
 async def cmd_stakes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_stakes(update.message)
+    msg = update.message
+    if not msg:
+        return
+    await send_stakes(msg)
 
 
 async def cmd_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_referral(update.message)
+    msg = update.message
+    if not msg:
+        return
+    await send_referral(msg)
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Answer a user question about Kickchain."""
-    question = " ".join(context.args).strip() if context.args else ""
+    msg = update.message
+    if not msg:
+        return
+
+    args = context.args or []
+    question = " ".join(args).strip()
     if not question:
-        await update.message.reply_text(
+        await msg.reply_text(
             "❓ Usage: `/ask <your question>`\n\nExample: `/ask when does the game launch?`",
             parse_mode="Markdown",
             reply_markup=MAIN_INLINE_MENU,
@@ -895,11 +949,14 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     answer = generate_answer(question)
-    await update.message.reply_text(answer, reply_markup=MAIN_INLINE_MENU)
+    await msg.reply_text(answer, reply_markup=MAIN_INLINE_MENU)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_main_menu(update.message)
+    msg = update.message
+    if not msg:
+        return
+    await send_main_menu(msg)
 
 
 async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -921,7 +978,8 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    text = " ".join(context.args).strip() if context.args else ""
+    args = context.args or []
+    text = " ".join(args).strip()
     if not text and msg.reply_to_message and msg.reply_to_message.text:
         text = msg.reply_to_message.text.strip()
 
@@ -969,7 +1027,10 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == ASK_BTN:
-        context.user_data["awaiting_ask_question"] = True
+        user_data = context.user_data
+        if user_data is None:
+            return
+        user_data["awaiting_ask_question"] = True
         # Use reply_text if available, else fallback to send_message
         if hasattr(msg, 'reply_text'):
             await msg.reply_text(
@@ -996,22 +1057,43 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
-    msg = query.message
-    if not msg:
+    user_data = context.user_data
+    if user_data is None:
         return
+    msg = query.message
+    chat_id = msg.chat.id if msg else query.from_user.id
 
     if query.data == CB_PROJECT:
-        await send_project(msg)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=PROJECT_TEXT,
+            parse_mode="Markdown",
+            reply_markup=MAIN_INLINE_MENU,
+        )
         return
     if query.data == CB_STAKES:
-        await send_stakes(msg)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=STAKES_TEXT,
+            parse_mode="Markdown",
+            reply_markup=MAIN_INLINE_MENU,
+        )
         return
     if query.data == CB_REFERRAL:
-        await send_referral(msg)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=REFERRAL_TEXT,
+            parse_mode="Markdown",
+            reply_markup=MAIN_INLINE_MENU,
+        )
         return
     if query.data == CB_ASK:
-        context.user_data["awaiting_ask_question"] = True
-        await msg.reply_text("❓ Send your question now and I'll answer it.", reply_markup=MAIN_INLINE_MENU)
+        user_data["awaiting_ask_question"] = True
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❓ Send your question now and I'll answer it.",
+            reply_markup=MAIN_INLINE_MENU,
+        )
         return
 
 
@@ -1020,16 +1102,18 @@ async def on_private_ask_input(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.message
     if not msg or not msg.text:
         return
-    if update.effective_chat.type != "private":
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
         return
-    if not context.user_data.get("awaiting_ask_question"):
+    user_data = context.user_data
+    if not user_data or not user_data.get("awaiting_ask_question"):
         return
 
     text = msg.text.strip()
     if not text or text.startswith("/"):
         return
 
-    context.user_data["awaiting_ask_question"] = False
+    user_data["awaiting_ask_question"] = False
     answer = generate_answer(text)
     await msg.reply_text(answer, reply_markup=MAIN_INLINE_MENU)
 
@@ -1045,9 +1129,10 @@ async def cmd_opinions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⛔ Admin only command.")
         return
 
-    if context.args:
+    args = context.args or []
+    if args:
         try:
-            n = max(1, min(int(context.args[0]), 50))
+            n = max(1, min(int(args[0]), 50))
         except ValueError:
             await msg.reply_text("Usage: /opinions [n]")
             return
@@ -1098,9 +1183,10 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     n = 10
-    if context.args:
+    args = context.args or []
+    if args:
         try:
-            n = max(1, min(int(context.args[0]), 50))
+            n = max(1, min(int(args[0]), 50))
         except ValueError:
             await msg.reply_text("Usage: /memory [n]")
             return
@@ -1142,11 +1228,12 @@ async def cmd_scanhistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⛔ Admin only command.")
         return
 
-    export_path = context.args[0] if len(context.args) >= 1 else DEFAULT_HISTORY_EXPORT_PATH
+    args = context.args or []
+    export_path = args[0] if len(args) >= 1 else DEFAULT_HISTORY_EXPORT_PATH
     limit = 0
-    if len(context.args) >= 2:
+    if len(args) >= 2:
         try:
-            limit = max(0, int(context.args[1]))
+            limit = max(0, int(args[1]))
         except ValueError:
             await msg.reply_text("Usage: /scanhistory [path] [limit]")
             return
@@ -1196,6 +1283,9 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Reply to a user's message to ban them.")
         return
     target = msg.reply_to_message.from_user
+    if not target:
+        await msg.reply_text("Couldn't identify that user to ban.")
+        return
     await context.bot.ban_chat_member(chat.id, target.id)
     await msg.reply_text(f"🚫 {target.full_name} has been banned.")
 
@@ -1213,6 +1303,9 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Reply to a user's message to mute them.")
         return
     target = msg.reply_to_message.from_user
+    if not target:
+        await msg.reply_text("Couldn't identify that user to mute.")
+        return
     until = datetime.utcnow() + timedelta(hours=1)
     await context.bot.restrict_chat_member(
         chat.id,
@@ -1236,12 +1329,38 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Reply to a user's message to unmute them.")
         return
     target = msg.reply_to_message.from_user
+    if not target:
+        await msg.reply_text("Couldn't identify that user to unmute.")
+        return
     await context.bot.restrict_chat_member(
         chat.id,
         target.id,
         get_unmute_permissions(getattr(chat, "permissions", None)),
     )
     await msg.reply_text(f"🔊 {target.full_name} has been unmuted.")
+
+
+async def cmd_testdm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: verify bot can DM all admins."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not is_admin(user.id):
+        await msg.reply_text("⛔ Admin only command.")
+        return
+
+    test_text = (
+        "✅ Admin DM test from Kickchain bot.\n"
+        "If you can read this, private DM delivery is working."
+    )
+    ok, failures = await dm_admins(context, test_text)
+    response = [f"DM test result: {ok}/{len(ADMIN_CHAT_IDS)} delivered."]
+    if failures:
+        response.append("")
+        response.append("Failures:")
+        response.extend(failures[:5])
+    await msg.reply_text("\n".join(response), reply_markup=MAIN_INLINE_MENU)
 
 
 async def post_init(app: Application):
@@ -1257,6 +1376,7 @@ async def post_init(app: Application):
         BotCommand("opinions", "Admin: view collected opinions"),
         BotCommand("memory", "Admin: view saved chat memory"),
         BotCommand("scanhistory", "Admin: import history export"),
+        BotCommand("testdm", "Admin: test private DMs"),
     ]
     await app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
     await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
@@ -1334,17 +1454,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"[keyword_match={matched_by_keywords}, forward_all={FORWARD_ALL_GROUP_TEXT}]"
     )
     logger.info(f"[OPINION] Attempting to send to admins: {ADMIN_CHAT_IDS}")
-    for admin_id in ADMIN_CHAT_IDS:
-        try:
-            logger.info(f"[OPINION] Sending to admin {admin_id}")
-            await context.bot.send_message(
-                admin_id,
-                admin_msg,
-                disable_web_page_preview=True,
-            )
-            logger.info(f"[OPINION] Sent to admin {admin_id}")
-        except Exception as e:
-            logger.error(f"Failed to forward opinion to admin {admin_id}: {e}")
+    ok, failures = await dm_admins(context, admin_msg)
+    logger.info("[OPINION] Forwarded to %s/%s admins", ok, len(ADMIN_CHAT_IDS))
+    if failures:
+        logger.warning("[OPINION] Admin DM failures: %s", " | ".join(failures))
 
 
 # ─────────────────────────────────────────────
@@ -1373,6 +1486,7 @@ def main():
     app.add_handler(CommandHandler("opinions", cmd_opinions))
     app.add_handler(CommandHandler("memory",   cmd_memory))
     app.add_handler(CommandHandler("scanhistory", cmd_scanhistory))
+    app.add_handler(CommandHandler("testdm",   cmd_testdm))
     app.add_handler(CommandHandler("ban",      cmd_ban))
     app.add_handler(CommandHandler("mute",     cmd_mute))
     app.add_handler(CommandHandler("unmute",   cmd_unmute))
@@ -1387,7 +1501,9 @@ def main():
         )
     )
     app.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^menu_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_private_ask_input))
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_ask_input)
+    )
 
     # New/left members
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
