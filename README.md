@@ -2,7 +2,7 @@
 
 A Telegram bot for the **Kickchain** community group that acts as:
 - **Group Moderator** — welcomes members, mutes flooders, ban/mute tools for admin
-- **Chat Assistant** — answers questions about Kickchain via `/ask`
+- **Chat Assistant** — answers questions via `/ask` using KB + saved chat memory
 - **Opinion Extractor** — silently detects and forwards community opinions/ideas to you in private chat
 
 ---
@@ -21,7 +21,7 @@ A Telegram bot for the **Kickchain** community group that acts as:
 ### 🤖 Chat Assistant (for group members)
 | Command | Description |
 |---|---|
-| `/ask <question>` | AI-powered answers about Kickchain (uses OpenAI if key provided, falls back to built-in KB) |
+| `/ask <question>` | Grounded answers using Kickchain KB + remembered chat history |
 | `/project` | Quick project summary |
 | `/stakes` | Stake tiers & rake fee table |
 | `/referral` | Referral program & VIP rakeback details |
@@ -45,11 +45,16 @@ When a qualifying message is found, you instantly receive a private message like
 ```
 
 All opinions are also saved to `opinions.jsonl` locally.
+All normal group messages are also saved in `memory/chat_memory.jsonl` for retrieval.
+
+For older messages, use `/scanhistory` to backfill memory + opinions from Telegram export history.
 
 ### 📋 Admin Commands
 | Command | Description |
 |---|---|
 | `/opinions [n]` | Show last N collected opinions (default: 10) |
+| `/memory [n]` | Show last N remembered chat messages (admin only) |
+| `/scanhistory [path] [limit]` | Backfill memory + opinions from Telegram exported history |
 | `/ban` | Ban user (reply to their message) |
 | `/mute` | Mute user 1hr (reply to their message) |
 | `/unmute` | Unmute user (reply to their message) |
@@ -78,15 +83,20 @@ cp config/.env.example config/.env
 
 ### 4. Install & run
 ```bash
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+# PowerShell:
+./scripts/run_bot.ps1
 
-# Install dependencies
-pip install -r requirements.txt
+# OR activate only:
+./scripts/activate_venv.ps1
+# Bash/WSL:
+source ./scripts/activate_venv.sh
 
 # Run the bot
 python bot.py
+```
+If PowerShell blocks script execution, run once:
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
 ### 5. (Optional) Enable smarter /ask with OpenAI
@@ -95,6 +105,28 @@ Add your OpenAI API key to `config/.env`:
 OPENAI_API_KEY=sk-...
 ```
 Without it, the bot uses a built-in keyword-based Q&A system covering all Kickchain topics.
+
+### 6. (Optional) Backfill memory + opinions from history
+Telegram bots cannot fetch full old chat history directly via Bot API.  
+To process older messages:
+
+1. Export group history from Telegram Desktop as JSON.
+2. Save the file as `config/group_history_export.json` (or any path).
+3. Run bot, then execute in Telegram (as admin):
+
+```text
+/scanhistory
+```
+
+Or with custom path/limit:
+```text
+/scanhistory config/group_history_export.json 5000
+```
+
+You can also pass Telegram Desktop HTML export path directly; the bot auto-uses sibling `result.json`:
+```text
+/scanhistory C:/Users/USER/Downloads/Telegram Desktop/ChatExport_2026-03-01/messages.html
+```
 
 ---
 
@@ -149,9 +181,16 @@ Messages shorter than 20 characters are ignored.
 kickchain_bot/
 ├── bot.py            # Main bot code
 ├── requirements.txt  # Python dependencies
+├── scripts/
+│   ├── activate_venv.ps1  # Auto-create/activate venv on PowerShell
+│   ├── activate_venv.sh   # Auto-create/activate venv on bash/WSL
+│   └── run_bot.ps1        # Activate venv + run bot in one command
 ├── config/
 │   ├── .env.example  # Environment template
-│   └── .env          # Your actual secrets (never commit this!)
+│   ├── .env          # Your actual secrets (never commit this!)
+│   └── group_history_export.json  # Optional Telegram export for /scanhistory
+├── memory/
+│   └── chat_memory.jsonl  # Auto-created persistent message memory
 └── opinions.jsonl    # Auto-created: log of all detected opinions
 ```
 # TG-Opinion-Scrapper

@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local environments
+venv/
+venv-win/
+
+# Secrets
+config/.env
+
+# Runtime/generated data
+memory/
+opinions.jsonl
+
+# OS/editor
+.DS_Store
+Thumbs.db
