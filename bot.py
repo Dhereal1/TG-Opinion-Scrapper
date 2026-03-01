@@ -38,7 +38,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
-    ChatMemberHandler,
 )
 from openai import OpenAI
 
@@ -61,6 +60,13 @@ def parse_int_env(name: str, default: int = 0) -> int:
     except ValueError:
         logging.warning("Invalid integer for %s: %r", name, raw)
         return default
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "y"}
 
 
 def parse_admin_ids() -> list[int]:
@@ -119,16 +125,18 @@ def parse_announcement_targets() -> list[int | str]:
             logging.warning("Skipping invalid ANNOUNCEMENT_CHANNEL_IDS value: %r", value)
     return targets
 
+
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()   # BotFather token
 GROUP_ID       = parse_int_env("GROUP_ID")            # Kickchain group chat ID
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # Optional: enables smart opinion detection
+FORWARD_ALL_GROUP_TEXT = parse_bool_env("FORWARD_ALL_GROUP_TEXT", True)
+STRICT_GROUP_ID_FILTER = parse_bool_env("STRICT_GROUP_ID_FILTER", False)
 
 # Multi-admin support (primary admin kept for backward compatibility).
 ADMIN_CHAT_IDS = parse_admin_ids()
-ADMIN_CHAT_ID = ADMIN_CHAT_IDS[0] if ADMIN_CHAT_IDS else 0
 ADMIN_CHAT_IDS_SET = set(ADMIN_CHAT_IDS)
 ANNOUNCEMENT_TARGETS = parse_announcement_targets()
 
@@ -296,6 +304,33 @@ def is_opinion(text: str) -> bool:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_CHAT_IDS_SET
+
+
+def get_mute_permissions() -> ChatPermissions:
+    """Compatibility-safe mute permissions for PTB 21.x."""
+    return ChatPermissions.no_permissions()
+
+
+def get_unmute_permissions(chat_permissions: ChatPermissions | None = None) -> ChatPermissions:
+    """
+    Prefer restoring chat default permissions. If missing, use explicit full
+    message permissions for PTB 21.6 fields.
+    """
+    if chat_permissions is not None:
+        return chat_permissions
+    return ChatPermissions(
+        can_send_messages=True,
+        can_send_audios=True,
+        can_send_documents=True,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_invite_users=True,
+    )
 
 
 def generate_answer(question: str) -> str:
@@ -673,12 +708,15 @@ def scan_history_export(export_path: str, limit: int = 0) -> dict:
 
 
 def build_admin_opinion_msg(user: str, text: str, msg_url: str = "") -> str:
-    link_part = f"\n🔗 [View in group]({msg_url})" if msg_url else ""
-    return (
-        f"💡 *New Opinion / Idea Detected*\n"
-        f"👤 *From:* {user}\n\n"
-        f"_{text}_{link_part}"
-    )
+    lines = [
+        "💡 New Opinion / Idea Detected",
+        f"👤 From: {user}",
+        "",
+        text,
+    ]
+    if msg_url:
+        lines.extend(["", f"🔗 View in group: {msg_url}"])
+    return "\n".join(lines)
 
 
 def is_flood(user_id: int) -> bool:
@@ -866,12 +904,17 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: publish an announcement to configured channels."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only command.")
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    if not is_admin(user.id):
+        await msg.reply_text("⛔ Admin only command.")
         return
 
     if not ANNOUNCEMENT_TARGETS:
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ No announcement channels configured.\n"
             "Set `ANNOUNCEMENT_CHANNEL_IDS` in config/.env.",
             parse_mode="Markdown",
@@ -879,11 +922,11 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = " ".join(context.args).strip() if context.args else ""
-    if not text and update.message.reply_to_message and update.message.reply_to_message.text:
-        text = update.message.reply_to_message.text.strip()
+    if not text and msg.reply_to_message and msg.reply_to_message.text:
+        text = msg.reply_to_message.text.strip()
 
     if not text:
-        await update.message.reply_text(
+        await msg.reply_text(
             "Usage: /announce <message>\nOr reply to a message with /announce",
             reply_markup=MAIN_INLINE_MENU,
         )
@@ -891,23 +934,24 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok = 0
     failed: list[str] = []
+    announcement_text = f"📢 Announcement\n\n{text}\n\n🎮 Play now: https://unique-parfait-7f420d.netlify.app/"
     for target in ANNOUNCEMENT_TARGETS:
         try:
-            await context.bot.send_message(chat_id=target, text=f"📢 Announcement\n\n{text}")
+            await context.bot.send_message(chat_id=target, text=announcement_text, reply_markup=MAIN_INLINE_MENU)
             ok += 1
         except Exception as e:
             failed.append(f"{target}: {e}")
 
-    msg = f"✅ Announcement sent to {ok}/{len(ANNOUNCEMENT_TARGETS)} channel(s)."
+    result_text = f"✅ Announcement sent to {ok}/{len(ANNOUNCEMENT_TARGETS)} channel(s)."
     if failed:
-        msg += "\n\nFailed:\n" + "\n".join(failed[:3])
-    await update.message.reply_text(msg, reply_markup=MAIN_INLINE_MENU)
+        result_text += "\n\nFailed:\n" + "\n".join(failed[:3])
+    await msg.reply_text(result_text, reply_markup=MAIN_INLINE_MENU)
 
 
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle UI button clicks for primary user actions."""
     msg = update.message
-    if not msg or not msg.text:
+    if not msg or not hasattr(msg, 'text') or not msg.text:
         return
 
     text = msg.text.strip()
@@ -926,10 +970,18 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == ASK_BTN:
         context.user_data["awaiting_ask_question"] = True
-        await msg.reply_text(
-            "❓ Send your question now and I'll answer it.",
-            reply_markup=MAIN_INLINE_MENU,
-        )
+        # Use reply_text if available, else fallback to send_message
+        if hasattr(msg, 'reply_text'):
+            await msg.reply_text(
+                "❓ Send your question now and I'll answer it.",
+                reply_markup=MAIN_INLINE_MENU,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=msg.chat.id,
+                text="❓ Send your question now and I'll answer it.",
+                reply_markup=MAIN_INLINE_MENU,
+            )
         return
 
     if text == MENU_BTN:
@@ -984,41 +1036,65 @@ async def on_private_ask_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cmd_opinions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: show last N collected opinions."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only command.")
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
         return
 
-    n = int(context.args[0]) if context.args else 10
+    if not is_admin(user.id):
+        await msg.reply_text("⛔ Admin only command.")
+        return
+
+    if context.args:
+        try:
+            n = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            await msg.reply_text("Usage: /opinions [n]")
+            return
+    else:
+        n = 10
+
     try:
         with open(opinions_log_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except FileNotFoundError:
-        await update.message.reply_text("No opinions logged yet.")
+        await msg.reply_text("No opinions logged yet.")
         return
 
     recent = lines[-n:]
     if not recent:
-        await update.message.reply_text("No opinions logged yet.")
+        await msg.reply_text("No opinions logged yet.")
         return
 
-    msg = f"📋 *Last {len(recent)} opinions:*\n\n"
+    response = [f"📋 Last {len(recent)} opinions:\n"]
     for line in recent:
         try:
             e = json.loads(line)
-            msg += f"👤 *{e['user']}* ({e['ts'][:10]})\n_{e['text']}_\n\n"
+            user_label = str(e.get("user", "unknown"))
+            ts = str(e.get("ts", ""))[:10]
+            text = normalize_text(str(e.get("text", "")))
+            response.append(f"👤 {user_label} ({ts})")
+            response.append(text)
+            response.append("")
         except Exception:
             pass
 
+    out = "\n".join(response).strip()
     # Telegram message limit
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n_...truncated_"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    if len(out) > 4000:
+        out = out[:4000] + "\n...truncated"
+    await msg.reply_text(out)
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: show last N remembered chat messages."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only command.")
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    if not is_admin(user.id):
+        await msg.reply_text("⛔ Admin only command.")
         return
 
     n = 10
@@ -1026,12 +1102,12 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             n = max(1, min(int(context.args[0]), 50))
         except ValueError:
-            await update.message.reply_text("Usage: /memory [n]")
+            await msg.reply_text("Usage: /memory [n]")
             return
 
     recent = load_recent_memory(limit=n)
     if not recent:
-        await update.message.reply_text("No memory saved yet.")
+        await msg.reply_text("No memory saved yet.")
         return
 
     rows = [f"🧠 Last {len(recent)} memory items:\n"]
@@ -1041,10 +1117,10 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = normalize_text(e.get("text", ""))[:120]
         rows.append(f"• [{ts}] {user}: {text}")
 
-    msg = "\n".join(rows)
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n...truncated"
-    await update.message.reply_text(msg)
+    out = "\n".join(rows)
+    if len(out) > 4000:
+        out = out[:4000] + "\n...truncated"
+    await msg.reply_text(out)
 
 
 async def cmd_scanhistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1057,40 +1133,45 @@ async def cmd_scanhistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /scanhistory "C:/.../ChatExport_2026-03-01/messages.html"
       /scanhistory config/group_history_export.json 5000
     """
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only command.")
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    if not is_admin(user.id):
+        await msg.reply_text("⛔ Admin only command.")
         return
 
     export_path = context.args[0] if len(context.args) >= 1 else DEFAULT_HISTORY_EXPORT_PATH
     limit = 0
     if len(context.args) >= 2:
         try:
-            limit = int(context.args[1])
+            limit = max(0, int(context.args[1]))
         except ValueError:
-            await update.message.reply_text("Usage: /scanhistory [path] [limit]")
+            await msg.reply_text("Usage: /scanhistory [path] [limit]")
             return
 
     try:
         stats = scan_history_export(export_path, limit)
     except FileNotFoundError:
-        await update.message.reply_text(
+        await msg.reply_text(
             f"❌ Export file not found: `{export_path}`\n"
             "Place Telegram export JSON there or pass a custom path.",
             parse_mode="Markdown",
         )
         return
     except json.JSONDecodeError:
-        await update.message.reply_text(
+        await msg.reply_text(
             f"❌ Invalid JSON in file: `{export_path}`",
             parse_mode="Markdown",
         )
         return
     except Exception as e:
         logger.exception("History scan failed")
-        await update.message.reply_text(f"❌ Scan failed: {e}")
+        await msg.reply_text(f"❌ Scan failed: {e}")
         return
 
-    await update.message.reply_text(
+    await msg.reply_text(
         "✅ *History Scan Complete*\n\n"
         f"• Source file: `{stats['source_path']}`\n"
         f"• Total messages loaded: *{stats['total_messages']}*\n"
@@ -1104,53 +1185,63 @@ async def cmd_scanhistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: ban a user by reply."""
-    if not is_admin(update.effective_user.id):
+    msg = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
         return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to ban them.")
+    if not is_admin(user.id):
         return
-    target = update.message.reply_to_message.from_user
-    await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-    await update.message.reply_text(f"🚫 {target.full_name} has been banned.")
+    if not msg.reply_to_message:
+        await msg.reply_text("Reply to a user's message to ban them.")
+        return
+    target = msg.reply_to_message.from_user
+    await context.bot.ban_chat_member(chat.id, target.id)
+    await msg.reply_text(f"🚫 {target.full_name} has been banned.")
 
 
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: mute a user by reply (1 hour default)."""
-    if not is_admin(update.effective_user.id):
+    msg = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
         return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to mute them.")
+    if not is_admin(user.id):
         return
-    target = update.message.reply_to_message.from_user
+    if not msg.reply_to_message:
+        await msg.reply_text("Reply to a user's message to mute them.")
+        return
+    target = msg.reply_to_message.from_user
     until = datetime.utcnow() + timedelta(hours=1)
     await context.bot.restrict_chat_member(
-        update.effective_chat.id,
+        chat.id,
         target.id,
-        ChatPermissions(can_send_messages=False),
+        get_mute_permissions(),
         until_date=until,
     )
-    await update.message.reply_text(f"🔇 {target.full_name} has been muted for 1 hour.")
+    await msg.reply_text(f"🔇 {target.full_name} has been muted for 1 hour.")
 
 
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: unmute a user by reply."""
-    if not is_admin(update.effective_user.id):
+    msg = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
         return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a user's message to unmute them.")
+    if not is_admin(user.id):
         return
-    target = update.message.reply_to_message.from_user
+    if not msg.reply_to_message:
+        await msg.reply_text("Reply to a user's message to unmute them.")
+        return
+    target = msg.reply_to_message.from_user
     await context.bot.restrict_chat_member(
-        update.effective_chat.id,
+        chat.id,
         target.id,
-        ChatPermissions(
-            can_send_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-        ),
+        get_unmute_permissions(getattr(chat, "permissions", None)),
     )
-    await update.message.reply_text(f"🔊 {target.full_name} has been unmuted.")
+    await msg.reply_text(f"🔊 {target.full_name} has been unmuted.")
 
 
 async def post_init(app: Application):
@@ -1179,18 +1270,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     2. Opinion/idea extraction → forward to admin
     """
     msg = update.message
-    if not msg or not msg.text:
+    if not msg:
         return
 
-    # Only process target group messages for moderation/memory/opinion extraction.
-    if msg.chat.id != GROUP_ID:
+    # Process group/supergroup chats. If GROUP_ID is set, enforce it.
+    if msg.chat.type not in {"group", "supergroup"}:
+        return
+    if STRICT_GROUP_ID_FILTER and GROUP_ID and msg.chat.id != GROUP_ID:
         return
 
     user = msg.from_user
     if not user:
         return
 
-    text = msg.text.strip()
+    raw_text = msg.text or msg.caption or ""
+    text = raw_text.strip()
+    if not text:
+        return
     user_id = user.id
     username = user.username or user.full_name or str(user_id)
 
@@ -1201,7 +1297,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.restrict_chat_member(
                 msg.chat.id,
                 user_id,
-                ChatPermissions(can_send_messages=False),
+                get_mute_permissions(),
                 until_date=until,
             )
             await msg.reply_text(
@@ -1221,24 +1317,34 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── 2. MEMORY CAPTURE ─────────────────────────────────────
     log_chat_memory(username, user_id, text, msg_url=msg_url, source="live")
 
-    # ── 3. OPINION EXTRACTION ─────────────────────────────────
-    if len(text) < OPINION_MIN_LEN:
+    # ── 3. OPINION EXTRACTION / FORWARDING ────────────────────
+    matched_by_keywords = len(text) >= OPINION_MIN_LEN and is_opinion(text)
+    should_forward = FORWARD_ALL_GROUP_TEXT or matched_by_keywords
+    if not should_forward:
         return
 
-    if is_opinion(text):
-        log_opinion(username, user_id, text, msg_url)
+    log_opinion(username, user_id, text, msg_url)
 
-        admin_msg = build_admin_opinion_msg(username, text, msg_url)
-        for admin_id in ADMIN_CHAT_IDS:
-            try:
-                await context.bot.send_message(
-                    admin_id,
-                    admin_msg,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.error("Failed to forward opinion to admin %s: %s", admin_id, e)
+    admin_msg = build_admin_opinion_msg(username, text, msg_url)
+    if FORWARD_ALL_GROUP_TEXT and not matched_by_keywords:
+        admin_msg = f"{admin_msg}\n\nℹ️ Captured via FORWARD_ALL_GROUP_TEXT"
+
+    logger.info(
+        f"[OPINION] Forwarding from {username} ({user_id}) "
+        f"[keyword_match={matched_by_keywords}, forward_all={FORWARD_ALL_GROUP_TEXT}]"
+    )
+    logger.info(f"[OPINION] Attempting to send to admins: {ADMIN_CHAT_IDS}")
+    for admin_id in ADMIN_CHAT_IDS:
+        try:
+            logger.info(f"[OPINION] Sending to admin {admin_id}")
+            await context.bot.send_message(
+                admin_id,
+                admin_msg,
+                disable_web_page_preview=True,
+            )
+            logger.info(f"[OPINION] Sent to admin {admin_id}")
+        except Exception as e:
+            logger.error(f"Failed to forward opinion to admin {admin_id}: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1287,8 +1393,8 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
 
-    # All text messages (opinion detection + flood control)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # Group messages/captions (opinion detection + flood control)
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_message))
 
     logger.info("🚀 Kickchain Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
