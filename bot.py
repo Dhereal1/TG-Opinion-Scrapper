@@ -17,7 +17,7 @@ import re
 import logging
 import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 
@@ -133,8 +133,16 @@ def parse_announcement_targets() -> list[int | str]:
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()   # BotFather token
 GROUP_ID       = parse_int_env("GROUP_ID")            # Kickchain group chat ID
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # Optional: enables smart opinion detection
-FORWARD_ALL_GROUP_TEXT = parse_bool_env("FORWARD_ALL_GROUP_TEXT", True)
 STRICT_GROUP_ID_FILTER = parse_bool_env("STRICT_GROUP_ID_FILTER", False)
+SAVE_ALL_GROUP_TO_MEMORY = parse_bool_env("SAVE_ALL_GROUP_TO_MEMORY", True)
+AUTO_SIGNAL_SUMMARY = parse_bool_env("AUTO_SIGNAL_SUMMARY", True)
+SIGNAL_SUMMARY_WINDOW_HOURS = max(1, parse_int_env("SIGNAL_SUMMARY_WINDOW_HOURS", 2))
+SIGNAL_SUMMARY_INTERVAL_MINUTES = max(5, parse_int_env("SIGNAL_SUMMARY_INTERVAL_MINUTES", 120))
+SIGNAL_SUMMARY_MIN_COUNT = max(1, parse_int_env("SIGNAL_SUMMARY_MIN_COUNT", 3))
+SIGNAL_SUMMARY_EXAMPLES_PER_CATEGORY = max(
+    1,
+    min(3, parse_int_env("SIGNAL_SUMMARY_EXAMPLES_PER_CATEGORY", 2)),
+)
 
 # Multi-admin support (primary admin kept for backward compatibility).
 ADMIN_CHAT_IDS = parse_admin_ids()
@@ -215,38 +223,38 @@ GO-TO-MARKET:
 """
 
 # ─────────────────────────────────────────────
-# OPINION / IDEA DETECTION KEYWORDS
+# SIGNAL DETECTION (opinions/ideas/feedback)
 # ─────────────────────────────────────────────
-OPINION_KEYWORDS = [
-    # Suggestions / ideas
-    r"\bshould\b", r"\bcould\b", r"\bwould be (great|nice|cool|better|awesome|good)\b",
-    r"\bwhy not\b", r"\bhow about\b", r"\bwhat if\b", r"\bi think\b", r"\bin my opinion\b",
-    r"\bimo\b", r"\bimho\b", r"\bsuggestion\b", r"\bsuggest\b", r"\bidea\b",
-    r"\bfeature\b", r"\badd\b.*\bgame\b", r"\bplease add\b", r"\bwish\b",
-    r"\bneed\b.*\bgame\b", r"\bmissing\b", r"\bwould love\b", r"\bit would be\b",
-    # Feedback / complaints
-    r"\bproblem\b", r"\bissue\b", r"\bbug\b", r"\bfix\b", r"\bbroken\b",
-    r"\bdoesn.t work\b", r"\bnot working\b", r"\bcrash\b",
-    # Requests
-    r"\bcan you\b", r"\bcan we\b", r"\bwill there be\b", r"\bwhen will\b",
-    r"\bplease\b.*\badd\b", r"\bplease\b.*\bchange\b",
-    # Positive / negative sentiment about the game
-    r"\blike\b.*\bgame\b", r"\blove\b.*\bgame\b", r"\bhate\b.*\bgame\b",
-    r"\bdon.t like\b", r"\bnot a fan\b",
-    # Gameplay specific
-    r"\bphysics\b", r"\bbalance\b", r"\bfair\b", r"\btournament\b",
-    r"\bleaderboard\b", r"\brank\b", r"\bmatchmaking\b", r"\blag\b",
-]
-OPINION_PATTERN = re.compile("|".join(OPINION_KEYWORDS), re.IGNORECASE)
-
-# Minimum message length to consider it an opinion
-OPINION_MIN_LEN = 20
+MIN_LEN_SIGNAL = 18
+LOW_SIGNAL = {"nice", "cool", "wow", "great", "amazing", "fire", "gm", "lol"}
+CATEGORY_PATTERNS: dict[str, re.Pattern[str]] = {
+    "idea/suggestion": re.compile(
+        r"(\bwhat if\b|\bhow about\b|\bwhy not\b|\bi suggest\b|\bsuggestion\b|\bidea\b|"
+        r"\bwould be (great|nice|cool|better)\b|\bplease add\b|\bcan you add\b)",
+        re.IGNORECASE,
+    ),
+    "feedback/review": re.compile(
+        r"(\bi (like|love|enjoy)\b|\bnot bad\b|\bgreat\b|\bamazing\b|\bawesome\b|"
+        r"\bterrible\b|\bbad\b|\bboring\b|\bfun\b|\baddictive\b)",
+        re.IGNORECASE,
+    ),
+    "complaint/bug": re.compile(
+        r"(\bbug\b|\bissue\b|\bproblem\b|\bbroken\b|\bnot working\b|\bdoesn.?t work\b|"
+        r"\bcrash\b|\blag\b|\bglitch\b|\bfreeze\b|\bfix\b)",
+        re.IGNORECASE,
+    ),
+    "request/question": re.compile(
+        r"(\bcan you\b|\bcan we\b|\bwill there be\b|\bwhen will\b|\bis it possible\b|\bany plan to\b)",
+        re.IGNORECASE,
+    ),
+}
 
 # ─────────────────────────────────────────────
 # STATE
 # ─────────────────────────────────────────────
 # flood tracking: {user_id: [timestamp, ...]}
 flood_tracker: dict[int, list] = defaultdict(list)
+last_auto_signal_summary_signature = ""
 
 # collected opinions (in-memory, also logged to opinions.jsonl)
 opinions_log_path = BASE_DIR / "opinions.jsonl"
@@ -275,6 +283,11 @@ CB_PROJECT = "menu_project"
 CB_STAKES = "menu_stakes"
 CB_REFERRAL = "menu_referral"
 
+CB_OP_APPROVE = "op_approve"
+CB_OP_REWRITE = "op_rewrite"
+CB_OP_IGNORE = "op_ignore"
+CB_OP_SAVE = "op_save"
+
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [ASK_BTN, PROJECT_BTN],
@@ -296,11 +309,25 @@ MAIN_INLINE_MENU = InlineKeyboardMarkup(
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
+def detect_signal(text: str) -> str | None:
+    """Return signal category if message is meaningful feedback/opinion, else None."""
+    t = normalize_text(text)
+    if len(t) < MIN_LEN_SIGNAL:
+        return None
+    if t.lower() in LOW_SIGNAL:
+        return None
+    if re.fullmatch(r"[\W_]+", t):
+        return None
+
+    for category, pattern in CATEGORY_PATTERNS.items():
+        if pattern.search(t):
+            return category
+    return None
+
+
 def is_opinion(text: str) -> bool:
-    """Return True if the message looks like an opinion or idea."""
-    if len(text) < OPINION_MIN_LEN:
-        return False
-    return bool(OPINION_PATTERN.search(text))
+    """Backward-compatible helper."""
+    return detect_signal(text) is not None
 
 
 def is_admin(user_id: int) -> bool:
@@ -413,10 +440,11 @@ def log_opinion(
     msg_url: str = "",
     source: str = "live",
     original_ts: str = "",
+    category: str = "",
 ):
     """Append opinion to local JSONL file."""
     entry = {
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
         "user": user,
         "user_id": user_id,
         "text": text,
@@ -425,6 +453,8 @@ def log_opinion(
     }
     if original_ts:
         entry["original_ts"] = original_ts
+    if category:
+        entry["category"] = category
     with open(opinions_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -496,7 +526,7 @@ def log_chat_memory(
 
     chat_memory_path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
         "user": user,
         "user_id": user_id,
         "text": clean,
@@ -684,7 +714,8 @@ def scan_history_export(export_path: str, limit: int = 0) -> dict:
             existing_memory.add(dedupe_key)
             memory_inserted += 1
 
-        if len(text) >= OPINION_MIN_LEN and is_opinion(text):
+        category = detect_signal(text)
+        if category:
             opinions_matched += 1
             if dedupe_key not in existing_opinions:
                 log_opinion(
@@ -694,6 +725,7 @@ def scan_history_export(export_path: str, limit: int = 0) -> dict:
                     msg_url=msg_url,
                     source="history",
                     original_ts=original_ts,
+                    category=category,
                 )
                 existing_opinions.add(dedupe_key)
                 opinions_inserted += 1
@@ -706,6 +738,160 @@ def scan_history_export(export_path: str, limit: int = 0) -> dict:
         "matched_opinions": opinions_matched,
         "inserted_new_opinions": opinions_inserted,
     }
+
+
+def parse_iso_ts(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def collect_signal_stats(window_hours: int) -> dict:
+    """
+    Summarize categorized signals from opinions.jsonl for the given time window.
+    """
+    window_hours = max(1, int(window_hours))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+
+    by_category: dict[str, int] = defaultdict(int)
+    examples_by_category: dict[str, list[str]] = defaultdict(list)
+    unique_users: set[int] = set()
+    newest_ts = ""
+    total = 0
+
+    recent_lines: deque[str] = deque(maxlen=12000)
+    try:
+        with open(opinions_log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                recent_lines.append(line)
+    except FileNotFoundError:
+        return {
+            "window_hours": window_hours,
+            "total": 0,
+            "unique_users": 0,
+            "by_category": {},
+            "examples_by_category": {},
+            "newest_ts": "",
+        }
+
+    for line in recent_lines:
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+
+        category = str(entry.get("category", "")).strip().lower()
+        if not category:
+            continue
+
+        ts_value = str(entry.get("ts", "")).strip()
+        ts = parse_iso_ts(ts_value)
+        if ts is None or ts < cutoff:
+            continue
+
+        total += 1
+        by_category[category] += 1
+        if ts_value > newest_ts:
+            newest_ts = ts_value
+
+        user_id_raw = entry.get("user_id")
+        if isinstance(user_id_raw, int):
+            unique_users.add(user_id_raw)
+
+        text = normalize_text(str(entry.get("text", "")))
+        if text and len(examples_by_category[category]) < SIGNAL_SUMMARY_EXAMPLES_PER_CATEGORY:
+            examples_by_category[category].append(text[:140])
+
+    sorted_categories = dict(
+        sorted(by_category.items(), key=lambda item: item[1], reverse=True)
+    )
+
+    return {
+        "window_hours": window_hours,
+        "total": total,
+        "unique_users": len(unique_users),
+        "by_category": sorted_categories,
+        "examples_by_category": dict(examples_by_category),
+        "newest_ts": newest_ts,
+    }
+
+
+def build_signal_summary_text(stats: dict, title: str = "📊 Signal Summary") -> str:
+    window_hours = int(stats.get("window_hours", SIGNAL_SUMMARY_WINDOW_HOURS))
+    total = int(stats.get("total", 0))
+    unique_users = int(stats.get("unique_users", 0))
+    by_category: dict[str, int] = stats.get("by_category", {})
+    examples_by_category: dict[str, list[str]] = stats.get("examples_by_category", {})
+
+    if total <= 0:
+        return f"{title} (last {window_hours}h)\nNo signals captured in this window."
+
+    lines = [
+        f"{title} (last {window_hours}h)",
+        f"Total signals: {total}",
+        f"Unique users: {unique_users}",
+        "",
+        "By category:",
+    ]
+    for category, count in by_category.items():
+        lines.append(f"- {category}: {count}")
+        examples = examples_by_category.get(category, [])
+        if examples:
+            lines.append(f"  e.g. {examples[0]}")
+
+    out = "\n".join(lines).strip()
+    if len(out) > 3900:
+        out = out[:3900] + "\n...truncated"
+    return out
+
+
+def build_signal_summary_signature(stats: dict) -> str:
+    parts = [
+        str(stats.get("window_hours", "")),
+        str(stats.get("total", "")),
+        str(stats.get("unique_users", "")),
+        str(stats.get("newest_ts", "")),
+    ]
+    by_category = stats.get("by_category", {})
+    parts.extend(f"{k}:{v}" for k, v in sorted(by_category.items()))
+    return "|".join(parts)
+
+
+async def maybe_send_auto_signal_summary(context: ContextTypes.DEFAULT_TYPE):
+    global last_auto_signal_summary_signature
+
+    stats = collect_signal_stats(SIGNAL_SUMMARY_WINDOW_HOURS)
+    total = int(stats.get("total", 0))
+    if total < SIGNAL_SUMMARY_MIN_COUNT:
+        logger.info(
+            "[SUMMARY] Skipping auto-summary (total=%s < min=%s)",
+            total,
+            SIGNAL_SUMMARY_MIN_COUNT,
+        )
+        return
+
+    signature = build_signal_summary_signature(stats)
+    if signature == last_auto_signal_summary_signature:
+        logger.info("[SUMMARY] Skipping auto-summary (no new signal changes)")
+        return
+
+    text = build_signal_summary_text(stats, title="📊 Auto Signal Summary")
+    ok, failures = await dm_admins(context, text)
+    logger.info("[SUMMARY] Auto-summary sent to %s/%s admins", ok, len(ADMIN_CHAT_IDS))
+    if failures:
+        logger.warning("[SUMMARY] Auto-summary DM failures: %s", " | ".join(failures))
+
+    last_auto_signal_summary_signature = signature
+
+
+async def job_signal_summary(context: ContextTypes.DEFAULT_TYPE):
+    await maybe_send_auto_signal_summary(context)
 
 
 def build_admin_opinion_msg(user: str, text: str, msg_url: str = "") -> str:
@@ -752,7 +938,7 @@ async def dm_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> tuple[int,
 
 def is_flood(user_id: int) -> bool:
     """Return True if user has sent too many messages in the flood window."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=FLOOD_WINDOW_SEC)
     flood_tracker[user_id] = [t for t in flood_tracker[user_id] if t > cutoff]
     flood_tracker[user_id].append(now)
@@ -984,12 +1170,22 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = msg.reply_to_message.text.strip()
 
     if not text:
+        user_data = context.user_data
+        if user_data is not None:
+            user_data["awaiting_announcement_text"] = True
         await msg.reply_text(
-            "Usage: /announce <message>\nOr reply to a message with /announce",
+            "📢 Announcement prompt enabled.\n"
+            "Send your announcement text now in *private chat* with the bot.\n\n"
+            "You can still use: /announce <message>",
+            parse_mode="Markdown",
             reply_markup=MAIN_INLINE_MENU,
         )
         return
 
+    await publish_announcement(context, msg, text)
+
+
+async def publish_announcement(context: ContextTypes.DEFAULT_TYPE, reply_message, text: str):
     ok = 0
     failed: list[str] = []
     announcement_text = f"📢 Announcement\n\n{text}\n\n🎮 Play now: https://unique-parfait-7f420d.netlify.app/"
@@ -1003,7 +1199,7 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_text = f"✅ Announcement sent to {ok}/{len(ANNOUNCEMENT_TARGETS)} channel(s)."
     if failed:
         result_text += "\n\nFailed:\n" + "\n".join(failed[:3])
-    await msg.reply_text(result_text, reply_markup=MAIN_INLINE_MENU)
+    await reply_message.reply_text(result_text, reply_markup=MAIN_INLINE_MENU)
 
 
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1106,16 +1302,50 @@ async def on_private_ask_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not chat or chat.type != "private":
         return
     user_data = context.user_data
-    if not user_data or not user_data.get("awaiting_ask_question"):
+    if not user_data:
         return
 
     text = msg.text.strip()
     if not text or text.startswith("/"):
         return
 
+    user = update.effective_user
+    if user and is_admin(user.id) and user_data.get("awaiting_announcement_text"):
+        user_data["awaiting_announcement_text"] = False
+        await publish_announcement(context, msg, text)
+        return
+
+    if not user_data.get("awaiting_ask_question"):
+        return
+
     user_data["awaiting_ask_question"] = False
     answer = generate_answer(text)
     await msg.reply_text(answer, reply_markup=MAIN_INLINE_MENU)
+
+
+async def cmd_signalsummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: summarize categorized signal volume in the last N hours."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    if not is_admin(user.id):
+        await msg.reply_text("⛔ Admin only command.")
+        return
+
+    window_hours = SIGNAL_SUMMARY_WINDOW_HOURS
+    args = context.args or []
+    if args:
+        try:
+            window_hours = max(1, min(int(args[0]), 168))
+        except ValueError:
+            await msg.reply_text("Usage: /signalsummary [hours]")
+            return
+
+    stats = collect_signal_stats(window_hours)
+    text = build_signal_summary_text(stats)
+    await msg.reply_text(text)
 
 
 async def cmd_opinions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1306,7 +1536,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target:
         await msg.reply_text("Couldn't identify that user to mute.")
         return
-    until = datetime.utcnow() + timedelta(hours=1)
+    until = datetime.now(timezone.utc) + timedelta(hours=1)
     await context.bot.restrict_chat_member(
         chat.id,
         target.id,
@@ -1373,6 +1603,7 @@ async def post_init(app: Application):
         BotCommand("stakes", "Stake tiers and rake"),
         BotCommand("referral", "Referral and VIP rakeback"),
         BotCommand("announce", "Admin: post to announcement channels"),
+        BotCommand("signalsummary", "Admin: summarize recent signal trends"),
         BotCommand("opinions", "Admin: view collected opinions"),
         BotCommand("memory", "Admin: view saved chat memory"),
         BotCommand("scanhistory", "Admin: import history export"),
@@ -1413,7 +1644,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── 1. ANTI-FLOOD ─────────────────────────────────────────
     if not is_admin(user_id) and is_flood(user_id):
         try:
-            until = datetime.utcnow() + timedelta(seconds=MUTE_DURATION)
+            until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_DURATION)
             await context.bot.restrict_chat_member(
                 msg.chat.id,
                 user_id,
@@ -1434,24 +1665,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg_url = build_message_url(msg.chat.id, msg.message_id)
 
-    # ── 2. MEMORY CAPTURE ─────────────────────────────────────
-    log_chat_memory(username, user_id, text, msg_url=msg_url, source="live")
+    # Optional memory capture for all group text.
+    if SAVE_ALL_GROUP_TO_MEMORY:
+        log_chat_memory(username, user_id, text, msg_url=msg_url, source="live")
 
-    # ── 3. OPINION EXTRACTION / FORWARDING ────────────────────
-    matched_by_keywords = len(text) >= OPINION_MIN_LEN and is_opinion(text)
-    should_forward = FORWARD_ALL_GROUP_TEXT or matched_by_keywords
-    if not should_forward:
+    # Signal-only forwarding (opinions/ideas/feedback/complaints/review).
+    category = detect_signal(text)
+    if not category:
         return
 
-    log_opinion(username, user_id, text, msg_url)
+    # If not saving all memory, still keep signal messages in memory.
+    if not SAVE_ALL_GROUP_TO_MEMORY:
+        log_chat_memory(username, user_id, text, msg_url=msg_url, source="live")
 
+    log_opinion(username, user_id, text, msg_url, category=category)
     admin_msg = build_admin_opinion_msg(username, text, msg_url)
-    if FORWARD_ALL_GROUP_TEXT and not matched_by_keywords:
-        admin_msg = f"{admin_msg}\n\nℹ️ Captured via FORWARD_ALL_GROUP_TEXT"
+    admin_msg = f"💡 Signal Detected: {category}\n\n{admin_msg}"
 
     logger.info(
-        f"[OPINION] Forwarding from {username} ({user_id}) "
-        f"[keyword_match={matched_by_keywords}, forward_all={FORWARD_ALL_GROUP_TEXT}]"
+        "[OPINION] Forwarding signal from %s (%s) [category=%s]",
+        username,
+        user_id,
+        category,
     )
     logger.info(f"[OPINION] Attempting to send to admins: {ADMIN_CHAT_IDS}")
     ok, failures = await dm_admins(context, admin_msg)
@@ -1483,6 +1718,7 @@ def main():
     app.add_handler(CommandHandler("referral", cmd_referral))
     app.add_handler(CommandHandler("ask",      cmd_ask))
     app.add_handler(CommandHandler("announce", cmd_announce))
+    app.add_handler(CommandHandler("signalsummary", cmd_signalsummary))
     app.add_handler(CommandHandler("opinions", cmd_opinions))
     app.add_handler(CommandHandler("memory",   cmd_memory))
     app.add_handler(CommandHandler("scanhistory", cmd_scanhistory))
@@ -1511,6 +1747,21 @@ def main():
 
     # Group messages/captions (opinion detection + flood control)
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_message))
+
+    if AUTO_SIGNAL_SUMMARY and app.job_queue:
+        interval = timedelta(minutes=SIGNAL_SUMMARY_INTERVAL_MINUTES)
+        app.job_queue.run_repeating(
+            job_signal_summary,
+            interval=interval,
+            first=interval,
+            name="auto_signal_summary",
+        )
+        logger.info(
+            "[SUMMARY] Auto signal summary enabled: every %sm, window=%sh, min_count=%s",
+            SIGNAL_SUMMARY_INTERVAL_MINUTES,
+            SIGNAL_SUMMARY_WINDOW_HOURS,
+            SIGNAL_SUMMARY_MIN_COUNT,
+        )
 
     logger.info("🚀 Kickchain Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
