@@ -323,7 +323,8 @@ PROJECT_TEXT = (
     "🛡️ *Anti-Cheat* — Server-authoritative engine, zero client trust\n"
     "🚫 *No Pay-to-Win* — Cosmetics only, skill decides everything\n\n"
     "📅 *Launch:* March–April 2026\n"
-    "📢 Channel: @kickchainchannel"
+    "📢 Channel: @kickchainchannel\n"
+    "🎮 Play now: https://unique-parfait-7f420d.netlify.app/"
 )
 
 STAKES_TEXT = (
@@ -743,7 +744,11 @@ def answer_question_basic(question: str, memory_snippets: list[dict]) -> str:
     q = question.lower()
 
     if any(w in q for w in ["launch", "release", "when", "ready"]):
-        return "🚀 Kickchain V1 is targeting a *March–April 2026* launch. Stay tuned in the channel @kickchainchannel!"
+        return (
+            "🚀 Kickchain V1 is targeting a *March–April 2026* launch. "
+            "Stay tuned in the channel @kickchainchannel!\n"
+            "🎮 Play now: https://unique-parfait-7f420d.netlify.app/"
+        )
 
     if any(w in q for w in ["stake", "money", "usdt", "usdc", "real money", "withdraw"]):
         return (
