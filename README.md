@@ -21,6 +21,7 @@ A Telegram bot for the **Kickchain** community group that acts as:
 ### 🤖 Chat Assistant (for group members)
 | Command | Description |
 |---|---|
+| `UI Buttons` | Tap Ask / Project / Stakes / Referral inline buttons (or use `/menu`) |
 | `/ask <question>` | Grounded answers using Kickchain KB + remembered chat history |
 | `/project` | Quick project summary |
 | `/stakes` | Stake tiers & rake fee table |
@@ -33,7 +34,7 @@ The bot **silently monitors all messages** and automatically detects:
 - Feedback & bugs ("issue", "problem", "not working")
 - Gameplay opinions (physics, balance, matchmaking, tournaments...)
 
-When a qualifying message is found, you instantly receive a private message like:
+When a qualifying message is found, configured admin(s) instantly receive a private message like:
 
 ```
 💡 New Opinion / Idea Detected
@@ -52,6 +53,7 @@ For older messages, use `/scanhistory` to backfill memory + opinions from Telegr
 ### 📋 Admin Commands
 | Command | Description |
 |---|---|
+| `/announce <text>` | Admin: send announcement to configured channels |
 | `/opinions [n]` | Show last N collected opinions (default: 10) |
 | `/memory [n]` | Show last N remembered chat messages (admin only) |
 | `/scanhistory [path] [limit]` | Backfill memory + opinions from Telegram exported history |
@@ -73,12 +75,15 @@ For older messages, use `/scanhistory` to backfill memory + opinions from Telegr
 
 ### 2. Get your IDs
 - **Your admin ID:** Message `@userinfobot` → copy "Id"
+- **Second admin ID (optional):** Repeat for your second admin account
 - **Group ID:** Forward any group message to `@userinfobot` → copy "Forwarded from chat Id" (starts with `-100`)
 
 ### 3. Configure environment
 ```bash
 cp config/.env.example config/.env
 # Edit config/.env with your BOT_TOKEN, ADMIN_CHAT_ID, GROUP_ID
+# Optional: SECOND_ADMIN_CHAT_ID (or ADMIN_CHAT_IDS comma-separated)
+# Optional: ANNOUNCEMENT_CHANNEL_IDS for /announce
 ```
 
 ### 4. Install & run
@@ -126,6 +131,16 @@ Or with custom path/limit:
 You can also pass Telegram Desktop HTML export path directly; the bot auto-uses sibling `result.json`:
 ```text
 /scanhistory C:/Users/USER/Downloads/Telegram Desktop/ChatExport_2026-03-01/messages.html
+```
+
+### 7. (Optional) Channel announcements
+Set announcement targets in `config/.env`:
+```env
+ANNOUNCEMENT_CHANNEL_IDS=-1001234567890,@yourchannel
+```
+Then send (admin only):
+```text
+/announce Your announcement text here
 ```
 
 ---
