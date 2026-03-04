@@ -225,28 +225,51 @@ GO-TO-MARKET:
 # ─────────────────────────────────────────────
 # SIGNAL DETECTION (opinions/ideas/feedback)
 # ─────────────────────────────────────────────
-MIN_LEN_SIGNAL = 18
-LOW_SIGNAL = {"nice", "cool", "wow", "great", "amazing", "fire", "gm", "lol"}
-CATEGORY_PATTERNS: dict[str, re.Pattern[str]] = {
+CATEGORY_PATTERNS_V2: dict[str, re.Pattern[str]] = {
     "idea/suggestion": re.compile(
         r"(\bwhat if\b|\bhow about\b|\bwhy not\b|\bi suggest\b|\bsuggestion\b|\bidea\b|"
-        r"\bwould be (great|nice|cool|better)\b|\bplease add\b|\bcan you add\b)",
+        r"\bwould be (great|nice|cool|better)\b|\bplease add\b|\bcan you add\b|\badd\b|\bimplement\b)",
         re.IGNORECASE,
     ),
     "feedback/review": re.compile(
         r"(\bi (like|love|enjoy)\b|\bnot bad\b|\bgreat\b|\bamazing\b|\bawesome\b|"
-        r"\bterrible\b|\bbad\b|\bboring\b|\bfun\b|\baddictive\b)",
+        r"\bterrible\b|\bbad\b|\bboring\b|\bfun\b|\baddictive\b|\bhuge\b|\bfire\b)",
         re.IGNORECASE,
     ),
     "complaint/bug": re.compile(
         r"(\bbug\b|\bissue\b|\bproblem\b|\bbroken\b|\bnot working\b|\bdoesn.?t work\b|"
-        r"\bcrash\b|\blag\b|\bglitch\b|\bfreeze\b|\bfix\b)",
+        r"\bcrash\b|\blag\b|\bglitch\b|\bfreeze\b|\bhacker(s)?\b|\bhack(ed|ing)?\b|\bcheat\b)",
         re.IGNORECASE,
     ),
     "request/question": re.compile(
-        r"(\bcan you\b|\bcan we\b|\bwill there be\b|\bwhen will\b|\bis it possible\b|\bany plan to\b)",
+        r"(\bcan you\b|\bcan we\b|\bwill there be\b|\bwhen will\b|\bis it possible\b|\bany plan to\b|"
+        r"\bwho\b|\bhow long\b|\bapproximately\b)",
         re.IGNORECASE,
     ),
+    "demand/validation": re.compile(
+        r"(\bif you (get|make|build|fix)\b|\bwe all in\b|\byou already won\b|\bwe need\b|"
+        r"\bplayers need\b|\bhuge community\b|\bcommunity\b|\bmany (people|players)\b|\bhonest players\b)",
+        re.IGNORECASE,
+    ),
+    "expectation": re.compile(
+        r"(\bas long as\b|\bonly if\b|\bit should\b|\byou should\b|\bmust\b|\bneeds to\b|\bneed to\b)",
+        re.IGNORECASE,
+    ),
+    "competitor insight": re.compile(
+        r"(\bminiclip\b|\bsoccer stars\b|\bfifa\b|\bother game\b|\bdevelopers\b|\bprofit\b|\bcoins\b|\bads\b)",
+        re.IGNORECASE,
+    ),
+    "concern/risk": re.compile(
+        r"(\bsue\b|\bcopyright\b|\binfring(e|ement)\b|\blegal\b|\bscam\b|\bscamming\b|\bspammer(s)?\b)",
+        re.IGNORECASE,
+    ),
+}
+
+QUESTION_CHARS = {"?", "¿", "؟"}
+STRONG_PUNCT = {"!", "‼", "❗", "🔥"}
+LOW_SIGNAL_V2 = {
+    "nice", "cool", "wow", "great", "amazing", "fire", "gm", "lol", "lmao", "ok", "thanks",
+    "thank you", "ty", "grazie", "ciao", "benvenuto", "welcome", "hi", "hello",
 }
 
 # ─────────────────────────────────────────────
@@ -309,20 +332,73 @@ MAIN_INLINE_MENU = InlineKeyboardMarkup(
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-def detect_signal(text: str) -> str | None:
-    """Return signal category if message is meaningful feedback/opinion, else None."""
+def looks_like_welcome_or_smalltalk(low: str) -> bool:
+    return any(
+        phrase in low
+        for phrase in [
+            "welcome to the group",
+            "thanks for joining",
+            "glad to see you",
+            "benvenuto",
+            "ciao",
+            "grazie",
+            "thank you",
+            "thanks",
+        ]
+    )
+
+
+def detect_signal_v2(text: str) -> str | None:
+    """Smarter lightweight classifier: regex first, then punctuation/intent heuristics."""
     t = normalize_text(text)
-    if len(t) < MIN_LEN_SIGNAL:
+    if not t:
         return None
-    if t.lower() in LOW_SIGNAL:
+
+    low = t.lower().strip()
+    if looks_like_welcome_or_smalltalk(low):
         return None
+
+    if len(t) < 12:
+        if any(ch in t for ch in QUESTION_CHARS):
+            return "request/question"
+        return None
+
+    if low in LOW_SIGNAL_V2:
+        return None
+
     if re.fullmatch(r"[\W_]+", t):
         return None
 
-    for category, pattern in CATEGORY_PATTERNS.items():
-        if pattern.search(t):
-            return category
+    priority = [
+        "complaint/bug",
+        "concern/risk",
+        "request/question",
+        "idea/suggestion",
+        "expectation",
+        "demand/validation",
+        "competitor insight",
+        "feedback/review",
+    ]
+    for cat in priority:
+        if CATEGORY_PATTERNS_V2[cat].search(t):
+            return cat
+
+    if any(ch in t for ch in QUESTION_CHARS):
+        return "request/question"
+
+    padded_low = f" {low} "
+    if (" if " in padded_low or " as long as " in padded_low) and len(t) >= 18:
+        return "expectation"
+
+    if any(ch in t for ch in STRONG_PUNCT) and len(t) >= 18:
+        return "feedback/review"
+
     return None
+
+
+def detect_signal(text: str) -> str | None:
+    """Backward-compatible wrapper to use v2 detector everywhere."""
+    return detect_signal_v2(text)
 
 
 def is_opinion(text: str) -> bool:
