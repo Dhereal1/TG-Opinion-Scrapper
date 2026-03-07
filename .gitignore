@@ -12,7 +12,7 @@ config/.env
 
 # Runtime/generated data
 *.log
-memory/
+memory/chat_memory.jsonl
 opinions.jsonl
 
 # OS/editor

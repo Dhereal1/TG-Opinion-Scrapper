@@ -1,0 +1,5 @@
+Host my-server
+    HostName 72.62.148.156
+    User root
+    IdentityFile C:\Users\USER\.ssh\id_ed25519
+    IdentitiesOnly yes
