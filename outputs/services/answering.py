@@ -12,7 +12,6 @@ To improve answers: update core/knowledge_base.py or add keyword rules below.
 """
 
 import logging
-import re
 
 from core.config import OPENAI_API_KEY
 from core.knowledge_base import KICKCHAIN_KB
@@ -80,20 +79,7 @@ def _answer_kb_keywords(question: str) -> str | None:
             "• *Auto-flagging* — suspicious wallets frozen instantly"
         )
 
-    if re.search(r"\b(token|tokens|coin|coins|currency|currencies|tokenomics)\b", q):
-        return (
-            "🪙 *Kickchain Currency / Token Usage:*\n\n"
-            "Kickchain uses a dual-currency model:\n"
-            "• *Fun Coins* — in-game, non-withdrawable currency for free/fun mode\n"
-            "• *USDT/USDC* — real-stakes currency in paid matches (withdrawable winnings)\n\n"
-            "Token/coin usage is gameplay-focused (entry, rewards, progression), "
-            "while real-money value settles through supported stablecoins."
-        )
-
-    if (
-        any(w in q for w in ["launch", "release", "go live"])
-        or ("when" in q and any(w in q for w in ["launch", "release", "ready", "date"]))
-    ):
+    if any(w in q for w in ["launch", "release", "when", "ready", "date", "out"]):
         return (
             "📅 *Kickchain V1 Launch: March–April 2026*\n\n"
             "• ✅ Figma Design System — DONE\n"

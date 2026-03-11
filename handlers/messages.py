@@ -85,7 +85,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_chat_memory(username, user_id, text, msg_url=msg_url, source="live")
 
     log_opinion(username, user_id, text, msg_url, category=category)
-    admin_msg = f"💡 Signal Detected: {category}\n\n{build_admin_opinion_msg(username, text, msg_url)}"
+    admin_msg = build_admin_opinion_msg(username, text, msg_url=msg_url, category=category)
 
     logger.info("[OPINION] Forwarding signal from %s (%s) [category=%s]", username, user_id, category)
     ok, failures = await dm_admins(context, admin_msg)

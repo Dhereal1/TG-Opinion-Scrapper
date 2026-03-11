@@ -5,6 +5,7 @@ Opinion/signal JSONL storage and aggregation helpers.
 """
 
 import json
+import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,52 @@ from utils.helpers import normalize_text, make_dedupe_key
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 OPINIONS_LOG_PATH = BASE_DIR / "opinions.jsonl"
+
+CATEGORY_STYLE: dict[str, tuple[str, str]] = {
+    "idea/suggestion": ("💡", "Product Suggestion"),
+    "feedback/review": ("🧾", "Player Feedback"),
+    "complaint/bug": ("🚨", "Issue / Bug Report"),
+    "request/question": ("❓", "Question / Clarification"),
+    "demand/validation": ("📣", "Market Demand Signal"),
+    "expectation": ("📐", "Expectation / Condition"),
+    "competitor insight": ("🔍", "Competitor Insight"),
+    "concern/risk": ("⚠️", "Risk / Trust Concern"),
+}
+
+POSITIVE_WORDS = {
+    "great", "good", "love", "amazing", "awesome", "fun", "smooth", "excellent",
+    "nice", "perfect", "best", "enjoy",
+}
+NEGATIVE_WORDS = {
+    "bad", "terrible", "boring", "broken", "bug", "issue", "problem", "lag",
+    "glitch", "scam", "fraud", "slow", "annoying", "frustrating",
+}
+
+
+def _category_style(category: str) -> tuple[str, str]:
+    key = normalize_text(category).lower()
+    if key in CATEGORY_STYLE:
+        return CATEGORY_STYLE[key]
+    title = key.title() if key else "Community Signal"
+    return "💡", title
+
+
+def _classify_sentiment(text: str) -> tuple[str, str]:
+    low = normalize_text(text).lower()
+    pos = sum(1 for w in POSITIVE_WORDS if re.search(rf"\b{re.escape(w)}\b", low))
+    neg = sum(1 for w in NEGATIVE_WORDS if re.search(rf"\b{re.escape(w)}\b", low))
+    if neg > pos and neg > 0:
+        return "🔴", "Negative"
+    if pos > neg and pos > 0:
+        return "🟢", "Positive"
+    return "🟡", "Neutral"
+
+
+def _excerpt(text: str, max_chars: int = 220) -> str:
+    clean = normalize_text(text)
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 1].rstrip() + "…"
 
 
 
@@ -82,6 +129,7 @@ def collect_signal_stats(window_hours: int) -> dict:
 
     by_category: dict[str, int] = defaultdict(int)
     examples_by_category: dict[str, list[str]] = defaultdict(list)
+    users_by_category_count: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     unique_users: set[int] = set()
     newest_ts = ""
     total = 0
@@ -125,11 +173,18 @@ def collect_signal_stats(window_hours: int) -> dict:
         if isinstance(user_id_raw, int):
             unique_users.add(user_id_raw)
 
+        user_label = normalize_text(str(entry.get("user", ""))).strip() or "unknown"
+        users_by_category_count[category][user_label] += 1
+
         text = normalize_text(str(entry.get("text", "")))
         if text and len(examples_by_category[category]) < SIGNAL_SUMMARY_EXAMPLES_PER_CATEGORY:
-            examples_by_category[category].append(text[:140])
+            examples_by_category[category].append(_excerpt(text, max_chars=150))
 
     sorted_categories = dict(sorted(by_category.items(), key=lambda item: item[1], reverse=True))
+    users_by_category: dict[str, list[str]] = {}
+    for category, counts in users_by_category_count.items():
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+        users_by_category[category] = [name for name, _ in ranked[:3]]
 
     return {
         "window_hours": window_hours,
@@ -137,6 +192,7 @@ def collect_signal_stats(window_hours: int) -> dict:
         "unique_users": len(unique_users),
         "by_category": sorted_categories,
         "examples_by_category": dict(examples_by_category),
+        "users_by_category": users_by_category,
         "newest_ts": newest_ts,
     }
 
@@ -148,22 +204,28 @@ def build_signal_summary_text(stats: dict, title: str = "📊 Signal Summary") -
     unique_users = int(stats.get("unique_users", 0))
     by_category: dict[str, int] = stats.get("by_category", {})
     examples_by_category: dict[str, list[str]] = stats.get("examples_by_category", {})
+    users_by_category: dict[str, list[str]] = stats.get("users_by_category", {})
 
     if total <= 0:
         return f"{title} (last {window_hours}h)\nNo signals captured in this window."
 
     lines = [
         f"{title} (last {window_hours}h)",
-        f"Total signals: {total}",
-        f"Unique users: {unique_users}",
+        f"Signals: {total} | Active users: {unique_users}",
         "",
-        "By category:",
+        "Category breakdown:",
     ]
     for category, count in by_category.items():
-        lines.append(f"- {category}: {count}")
+        icon, label = _category_style(category)
+        pct = round((count / total) * 100) if total else 0
+        lines.append(f"{icon} {label}: {count} ({pct}%)")
+        users = users_by_category.get(category, [])
+        if users:
+            lines.append(f"Users: {', '.join(users)}")
         examples = examples_by_category.get(category, [])
         if examples:
-            lines.append(f"  e.g. {examples[0]}")
+            lines.append(f"Excerpt: \"{examples[0]}\"")
+        lines.append("")
 
     out = "\n".join(lines).strip()
     if len(out) > 3900:
@@ -185,13 +247,18 @@ def build_signal_summary_signature(stats: dict) -> str:
 
 
 
-def build_admin_opinion_msg(user: str, text: str, msg_url: str = "") -> str:
+def build_admin_opinion_msg(user: str, text: str, msg_url: str = "", category: str = "") -> str:
+    icon, label = _category_style(category)
+    sentiment_icon, sentiment_label = _classify_sentiment(text)
+    snippet = _excerpt(text, max_chars=320)
     lines = [
-        "💡 New Opinion / Idea Detected",
-        f"👤 From: {user}",
+        f"{icon} {label}",
+        "────────────────────────────",
+        f"👤 {user}",
+        f"{sentiment_icon} Sentiment: {sentiment_label}",
         "",
-        text,
+        f"💬 \"{snippet}\"",
     ]
     if msg_url:
-        lines.extend(["", f"🔗 View in group: {msg_url}"])
+        lines.extend(["", f"🔗 {msg_url}"])
     return "\n".join(lines)

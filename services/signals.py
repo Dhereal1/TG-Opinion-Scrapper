@@ -20,42 +20,61 @@ from utils.helpers import normalize_text
 
 logger = logging.getLogger(__name__)
 
+CATEGORY_IDEA = "idea/suggestion"
+CATEGORY_FEEDBACK = "feedback/review"
+CATEGORY_BUG = "complaint/bug"
+CATEGORY_QUESTION = "request/question"
+CATEGORY_DEMAND = "demand/validation"
+CATEGORY_EXPECTATION = "expectation"
+CATEGORY_COMPETITOR = "competitor insight"
+CATEGORY_RISK = "concern/risk"
+
+MIN_SIGNAL_CHARS = 30
+MIN_SIGNAL_WORDS = 5
+
 CATEGORY_PATTERNS_V2: dict[str, re.Pattern[str]] = {
-    "idea/suggestion": re.compile(
-        r"(\bwhat if\b|\bhow about\b|\bwhy not\b|\bi suggest\b|\bsuggestion\b|\bidea\b|"
-        r"\bwould be (great|nice|cool|better)\b|\bplease add\b|\bcan you add\b|\badd\b|\bimplement\b)",
+    CATEGORY_IDEA: re.compile(
+        r"(\bwhat if\b|\bhow about\b|\bwhy not\b|\bi suggest\b|\bmy suggestion\b|\bfeature request\b|"
+        r"\bidea\b|\bplease add\b|\bcan you add\b|\byou should add\b|\bconsider adding\b|"
+        r"\bwould love to see\b|\bit would be (great|better|useful)\b)",
         re.IGNORECASE,
     ),
-    "feedback/review": re.compile(
-        r"(\bi (like|love|enjoy)\b|\bnot bad\b|\bgreat\b|\bamazing\b|\bawesome\b|"
-        r"\bterrible\b|\bbad\b|\bboring\b|\bfun\b|\baddictive\b|\bhuge\b|\bfire\b)",
+    CATEGORY_FEEDBACK: re.compile(
+        r"(\bi (like|love|enjoy|prefer)\b|\bin my opinion\b|\boverall\b|\bthis is (great|good|bad|boring|fun)\b|"
+        r"\bfeels (great|good|bad|slow)\b|\bvery (good|bad|fun|smooth|laggy)\b)",
         re.IGNORECASE,
     ),
-    "complaint/bug": re.compile(
+    CATEGORY_BUG: re.compile(
         r"(\bbug\b|\bissue\b|\bproblem\b|\bbroken\b|\bnot working\b|\bdoesn.?t work\b|"
-        r"\bcrash\b|\blag\b|\bglitch\b|\bfreeze\b|\bhacker(s)?\b|\bhack(ed|ing)?\b|\bcheat\b)",
+        r"\bcrash(ed|ing|es)?\b|\blag(gy)?\b|\bglitch\b|\bfreeze\b|\bstuck\b|"
+        r"\bhacker(s)?\b|\bhack(ed|ing)?\b|\bcheat(ing)?\b|\bexploit\b)",
         re.IGNORECASE,
     ),
-    "request/question": re.compile(
-        r"(\bcan you\b|\bcan we\b|\bwill there be\b|\bwhen will\b|\bis it possible\b|\bany plan to\b|"
-        r"\bwho\b|\bhow long\b|\bapproximately\b)",
+    CATEGORY_QUESTION: re.compile(
+        r"(\bcan you\b|\bcould you\b|\bcan we\b|\bwill there be\b|\bwhen (will|is)\b|"
+        r"\bis it possible\b|\bany plan to\b|\bdo you plan\b|\bhow (do|does|can|long)\b|"
+        r"\bwhat (is|are)\b|\bwhere (is|can)\b|\bwhy (is|does)\b|\bwho (is|are)\b)",
         re.IGNORECASE,
     ),
-    "demand/validation": re.compile(
+    CATEGORY_DEMAND: re.compile(
         r"(\bif you (get|make|build|fix)\b|\bwe all in\b|\byou already won\b|\bwe need\b|"
-        r"\bplayers need\b|\bhuge community\b|\bcommunity\b|\bmany (people|players)\b|\bhonest players\b)",
+        r"\bplayers need\b|\bcommunity needs\b|\bmany (people|players)\b|\beveryone wants\b|"
+        r"\bthis will bring\b|\bmass adoption\b)",
         re.IGNORECASE,
     ),
-    "expectation": re.compile(
+    CATEGORY_EXPECTATION: re.compile(
         r"(\bas long as\b|\bonly if\b|\bit should\b|\byou should\b|\bmust\b|\bneeds to\b|\bneed to\b)",
         re.IGNORECASE,
     ),
-    "competitor insight": re.compile(
-        r"(\bminiclip\b|\bsoccer stars\b|\bfifa\b|\bother game\b|\bdevelopers\b|\bprofit\b|\bcoins\b|\bads\b)",
+    CATEGORY_COMPETITOR: re.compile(
+        r"(\bminiclip\b|\bsoccer stars\b|\bfifa\b|\bother game\b|\banother game\b|\bcompetitor(s)?\b|"
+        r"\bblack market\b|\bofficial store\b|\bapp store\b|\bplay store\b|\bcompared to\b|"
+        r"\bcompare(d)? with\b|\bcheaper than\b|\bpricing model\b|\bcoin price\b|\btoken price\b)",
         re.IGNORECASE,
     ),
-    "concern/risk": re.compile(
-        r"(\bsue\b|\bcopyright\b|\binfring(e|ement)\b|\blegal\b|\bscam\b|\bscamming\b|\bspammer(s)?\b)",
+    CATEGORY_RISK: re.compile(
+        r"(\bsue\b|\bcopyright\b|\binfring(e|ement)\b|\blegal\b|\bscam\b|\bscamming\b|"
+        r"\bfraud\b|\bsuspicious\b|\bunsafe\b|\bspammer(s)?\b)",
         re.IGNORECASE,
     ),
 }
@@ -63,7 +82,7 @@ CATEGORY_PATTERNS_V2: dict[str, re.Pattern[str]] = {
 QUESTION_CHARS = {"?", "¿", "؟"}
 STRONG_PUNCT = {"!", "‼", "❗", "🔥"}
 LOW_SIGNAL_V2 = {
-    "nice", "cool", "wow", "great", "amazing", "fire", "gm", "lol", "lmao", "ok", "thanks",
+    "nice", "cool", "wow", "great", "amazing", "fire", "gm", "lol", "lmao", "ok", "okay", "thanks",
     "thank you", "ty", "grazie", "ciao", "benvenuto", "welcome", "hi", "hello",
 }
 
@@ -78,6 +97,10 @@ def _looks_like_smalltalk(low: str) -> bool:
     )
 
 
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[a-zA-Z0-9_']+", text))
+
+
 
 def detect_signal(text: str) -> str | None:
     """Classify a message into a signal category, or return None."""
@@ -88,29 +111,37 @@ def detect_signal(text: str) -> str | None:
         return None
     if _looks_like_smalltalk(low):
         return None
-    if len(t) < 12:
-        return "request/question" if any(ch in t for ch in QUESTION_CHARS) else None
+    if len(t) < MIN_SIGNAL_CHARS:
+        return None
+    if _word_count(low) < MIN_SIGNAL_WORDS:
+        return None
     if low in LOW_SIGNAL_V2:
         return None
     if re.fullmatch(r"[\W_]+", t):
         return None
 
     priority = [
-        "complaint/bug", "concern/risk", "request/question", "idea/suggestion",
-        "expectation", "demand/validation", "competitor insight", "feedback/review",
+        CATEGORY_BUG,
+        CATEGORY_RISK,
+        CATEGORY_COMPETITOR,
+        CATEGORY_QUESTION,
+        CATEGORY_IDEA,
+        CATEGORY_EXPECTATION,
+        CATEGORY_DEMAND,
+        CATEGORY_FEEDBACK,
     ]
     for cat in priority:
         if CATEGORY_PATTERNS_V2[cat].search(t):
             return cat
 
     if any(ch in t for ch in QUESTION_CHARS):
-        return "request/question"
+        return CATEGORY_QUESTION
 
     padded = f" {low} "
     if (" if " in padded or " as long as " in padded) and len(t) >= 18:
-        return "expectation"
+        return CATEGORY_EXPECTATION
     if any(ch in t for ch in STRONG_PUNCT) and len(t) >= 18:
-        return "feedback/review"
+        return CATEGORY_FEEDBACK
 
     return None
 
